@@ -63,8 +63,9 @@ async def browse_and_subscribe_recursive(node, subscription, client, level=0):
             node_display_names[child_node_id_str] = child_display_name
 
             
-            print(ua.NodeClass.Variable, ua.NodeClass.Object, ua.NodeClass.Method)
-            
+            if (child.nodeid.NamespaceIndex) != 2:
+                _logger.debug(f"{indent}- Skipping node in non-default namespace: {child_display_name} ({child_node_id_str}) [NamespaceIndex: {child.nodeid.NamespaceIndex}]")
+                continue
 
             if node_class == ua.NodeClass.Variable:
                 _logger.info(f"{indent}- Subscribing to: {child_display_name} ({child_node_id_str}) [Type: {node_class.name}]")
@@ -119,19 +120,15 @@ async def write_value_to_node(client):
         print("  No nodes have been discovered yet. Connect and browse first!")
         return
     
-    # Display cached nodes for user reference, sorting by display name
     sorted_display_names = sorted(node_display_names.items(), key=lambda item: item[1])
     for node_id_str, display_name in sorted_display_names:
         print(f"  - {display_name} (NodeId: {node_id_str})")
 
-    # Use input() directly as this is a blocking user prompt within an async context
-    # It's generally fine for interactive prompts that are not performance-critical.
     node_identifier = input("Enter Node Display Name or NodeId (e.g., 'MyVariable' or 'ns=2;i=3'): ").strip()
     if not node_identifier:
         print("No node identifier entered. Aborting write operation.")
         return
 
-    # Try to find the node by display name first, then by NodeId string
     target_node = None
     # Check by display name
     for node_id_str, display_name in node_display_names.items():
@@ -139,16 +136,12 @@ async def write_value_to_node(client):
             target_node = node_cache.get(node_id_str)
             break
     
-    # If not found by display name, try by direct NodeId string from cache
     if not target_node:
         target_node = node_cache.get(node_identifier) 
     
-    # If still not found, try client.get_node which can parse various NodeId formats directly
     if not target_node:
         try:
-            target_node = await client.get_node(node_identifier) # Await get_node
-            # Add to cache if successfully retrieved directly
-            # FIX: Use str(target_node.nodeid)
+            target_node = await client.get_node(node_identifier) 
             node_cache[str(target_node.nodeid)] = target_node
             node_display_names[str(target_node.nodeid)] = (await target_node.read_display_name()).Text
         except Exception as e:
