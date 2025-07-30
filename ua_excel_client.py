@@ -22,26 +22,35 @@ DATATYPE_COL = 4 # Column D
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 _logger = logging.getLogger('opcua_async_client_app')
 
-node_cache = {}  # Stores asyncua.Node objects
-node_display_names = {} # Stores display names (NodeId_str -> DisplayName)
-node_excel_row = {} # Stores NodeId_str -> Excel Row
-excel_row_to_node_id = {} # Stores Excel Row -> NodeId_str
+node_cache = {}  # Stores asyncua.Node objects (NodeId_str -> Node_obj)
+node_display_names = {} # Stores display names (NodeId_str -> DisplayName_str)
+node_excel_row = {} # Stores NodeId_str -> Excel Row_int
+excel_row_to_node_id = {} # Stores Excel Row_int -> NodeId_str
 
 # Excel Workbook and Sheet objects (global for easy access)
 wb = None
 sheet = None
+
+# Variable to hold the active subscription object
+subscription = None
+
+# This dictionary will store the last known value from Excel for each row
+# Used to detect manual changes by the user in Excel
+excel_last_read_values = {} # --- FIXED: Defined globally here ---
 
 # --- Excel Functions ---
 def setup_excel():
     """Opens the Excel workbook and sets up headers if necessary."""
     global wb, sheet
     try:
+        # Try to open existing workbook
         wb = xw.Book(EXCEL_FILE)
     except Exception:
-        # If file doesn't exist, create it
+        # If file doesn't exist, create it and then reopen
+        _logger.info(f"Excel file '{EXCEL_FILE}' not found. Creating a new one.")
         wb = xw.Book()
         wb.save(EXCEL_FILE)
-        wb = xw.Book(EXCEL_FILE) # Reopen to get the actual workbook object
+        wb = xw.Book(EXCEL_FILE) # Reopen to ensure it's loaded correctly
 
     sheet = wb.sheets[SHEET_NAME]
 
@@ -53,17 +62,21 @@ def setup_excel():
         sheet.range((1, DATATYPE_COL)).value = "Data Type"
         _logger.info("Excel headers written.")
 
-    # Clear previous data (optional, but good for a fresh start)
-    sheet.range(f'A{START_ROW}:Z1048576').clear_contents() # Clear all data below headers
+    # Clear previous data (good for a fresh start, especially after a re-scan)
+    # Clear from START_ROW downwards
+    last_col = max(NODE_ID_COL, DISPLAY_NAME_COL, VALUE_COL, DATATYPE_COL)
+    sheet.range((START_ROW, 1), (sheet.cells.last_cell.row, last_col)).clear_contents()
+    _logger.info("Cleared existing data in Excel (below headers).")
+
 
 def get_next_available_row():
     """Finds the next empty row in Excel for writing new data."""
-    last_row = sheet.range((sheet.cells.last_cell.row, 1)).end('up').row
-    return max(START_ROW, last_row + 1)
+    last_used_row = sheet.range((sheet.cells.last_cell.row, NODE_ID_COL)).end('up').row
+    return max(START_ROW, last_used_row + 1)
 
 def write_data_to_excel(node_id_str, display_name, value, data_type):
     """Writes a single data point to Excel or updates an existing one."""
-    global node_excel_row, excel_row_to_node_id
+    global node_excel_row, excel_row_to_node_id, excel_last_read_values # --- FIXED: Add excel_last_read_values to globals ---
 
     row = node_excel_row.get(node_id_str)
     if row is None:
@@ -71,17 +84,22 @@ def write_data_to_excel(node_id_str, display_name, value, data_type):
         row = get_next_available_row()
         node_excel_row[node_id_str] = row
         excel_row_to_node_id[row] = node_id_str
-        _logger.debug(f"Assigned new Excel row {row} to Node: {display_name} ({node_id_str})")
+        _logger.debug(f"Assigned new Excel row {row} to Node: ({node_id_str})")
 
     # Write data to the specific cells
+    # Use tuple for range(row, column) to be precise
     sheet.range((row, NODE_ID_COL)).value = node_id_str
     sheet.range((row, DISPLAY_NAME_COL)).value = display_name
     sheet.range((row, VALUE_COL)).value = value
     sheet.range((row, DATATYPE_COL)).value = data_type
+    
+    # --- IMPORTANT FIX: Update excel_last_read_values when we write from OPC UA ---
+    # This prevents the change from OPC UA from immediately triggering an Excel->OPC UA write back
+    excel_last_read_values[row] = value 
     # _logger.debug(f"Excel updated: {display_name} = {value}")
 
 def read_data_from_excel_row(row):
-    """Reads the value from a specific Excel row."""
+    """Reads the value from a specific Excel row's Value column."""
     return sheet.range((row, VALUE_COL)).value
 
 # --- Subscription Handler (Async) ---
@@ -111,7 +129,7 @@ class SubHandler(object):
         _logger.info(f"EVENT: {event}")
 
 # --- Node Browsing and Subscription Logic (Async) ---
-async def browse_and_subscribe_recursive(node, subscription, client, level=0):
+async def browse_and_subscribe_recursive(node, subscription_obj, client, level=0):
     """
     Recursively browses nodes starting from 'node' and subscribes to data variables/properties.
     Caches all browsed nodes for later reference (e.g., writing).
@@ -124,65 +142,61 @@ async def browse_and_subscribe_recursive(node, subscription, client, level=0):
         _logger.warning(f"{indent}Could not browse children of '{await node.read_display_name()}' ({str(node.nodeid)}): {e}")
         return
 
-    _logger.debug(f"{indent}Browsing: {await node.read_display_name()} ({str(node.nodeid)}) - Found {len(children)} children.")
+    # _logger.debug(f"{indent}Browsing: {await node.read_display_name()} ({str(node.nodeid)}) - Found {len(children)} children.")
 
     for child in children:
         child_display_name = "N/A"
         child_node_id_str = str(child.nodeid)
 
         try:
-            child_display_name = (await child.read_display_name()).Text
-            node_class = await child.read_node_class()
+            child_display_name, node_class = await child.read_attributes([ua.AttributeIds.DisplayName, ua.AttributeIds.NodeClass])
+            child_display_name = child_display_name.Value.Value.Text
+            node_class = ua.NodeClass(node_class.Value.Value)
             
-            # Cache node info for later use (e.g., writing)
             node_cache[child_node_id_str] = child
             node_display_names[child_node_id_str] = child_display_name
 
-            # Skip nodes not in the server's default namespace (often 2 for simulator)
-            # You might need to adjust this depending on your OPC UA server
-            # if (child.nodeid.NamespaceIndex) != 2:
-            #     _logger.debug(f"{indent}- Skipping node in non-default namespace: {child_display_name} ({child_node_id_str}) [NamespaceIndex: {child.nodeid.NamespaceIndex}]")
-            #     continue
-
             if node_class == ua.NodeClass.Variable:
-                _logger.info(f"{indent}- Subscribing to: {child_display_name} ({child_node_id_str}) [Type: {node_class.name}]")
                 try:
-                    await subscription.subscribe_data_change(child)
-                    # Initialize Excel with current value
-                    current_data_value = await child.read_data_value()
-                    current_value = current_data_value.Value.Value
-                    data_type_name = current_data_value.Value.VariantType.name
-                    write_data_to_excel(child_node_id_str, child_display_name, current_value, data_type_name)
+                    await subscription_obj.subscribe_data_change(child)
                 except Exception as e:
                     _logger.warning(f"{indent}- Failed to subscribe to {child_display_name} ({child_node_id_str}): {e}")
             elif node_class == ua.NodeClass.Object:
-                _logger.info(f"{indent}- Found Object: {child_display_name} ({child_node_id_str}). Browsing deeper...")
-                await browse_and_subscribe_recursive(child, subscription, client, level + 1)
-            elif node_class == ua.NodeClass.Method:
-                _logger.debug(f"{indent}- Found Method: {child_display_name} ({child_node_id_str}). Skipping subscription.")
-            else:
-                _logger.debug(f"{indent}- Skipping node (not a Variable/Property/Object/Method): {child_display_name} ({child_node_id_str}) [Type: {node_class.name}]")
-
+                await browse_and_subscribe_recursive(child, subscription_obj, client, level + 1)
+            
         except Exception as e:
             _logger.warning(f"{indent}- Could not process node '{child_display_name}' ({child_node_id_str}): {e}")
 
 # --- Write Value Function (Async) ---
 def _convert_input_to_opc_type(value_str, target_variant_type):
+    """Converts a string value from Excel into the appropriate Python type for OPC UA."""
     try:
+        # Handle None/empty string explicitly if Excel cell is blank
+        if value_str is None or str(value_str).strip() == '':
+            _logger.debug(f"Input value for conversion is empty/None. Returning default for {target_variant_type.name}.")
+            # Return a default/zero equivalent for the type, or None if you prefer
+            if target_variant_type == ua.VariantType.Boolean: return False
+            if target_variant_type in [ua.VariantType.Int16, ua.VariantType.Int32, ua.VariantType.Int64, ua.VariantType.SByte, ua.VariantType.Byte, ua.VariantType.UInt16, ua.VariantType.UInt32, ua.VariantType.UInt64]: return 0
+            if target_variant_type in [ua.VariantType.Float, ua.VariantType.Double]: return 0.0
+            if target_variant_type in [ua.VariantType.String, ua.VariantType.LocalizedText]: return ""
+            return None # Fallback for unhandled types
+
+        # Actual conversion logic
         if target_variant_type == ua.VariantType.Boolean:
-            return value_str.lower() in ('true', '1', 't', 'y')
+            return str(value_str).lower() in ('true', '1', 't', 'y', 'yes', 'on')
         elif target_variant_type in [ua.VariantType.Int16, ua.VariantType.Int32, ua.VariantType.Int64,
                                      ua.VariantType.SByte, ua.VariantType.Byte, ua.VariantType.UInt16,
                                      ua.VariantType.UInt32, ua.VariantType.UInt64]:
-            return int(value_str)
+            return int(float(value_str)) # Use float() first to handle "1.0" for ints
         elif target_variant_type in [ua.VariantType.Float, ua.VariantType.Double]:
             return float(value_str)
         elif target_variant_type in [ua.VariantType.String, ua.VariantType.LocalizedText]:
             return str(value_str)
+        # Add more types as needed (e.g., DateTime, Guid, etc.)
         else:
             _logger.warning(f"Attempting to write value '{value_str}' to unhandled VariantType: {target_variant_type.name}. Trying direct string conversion.")
-            return value_str
-    except ValueError:
+            return str(value_str) # Fallback: return as string, let set_value try to convert
+    except (ValueError, TypeError): # Catch both conversion errors and NoneType errors
         _logger.error(f"Could not convert '{value_str}' to target type {target_variant_type.name}. Please check input.")
         return None
     except Exception as e:
@@ -196,18 +210,24 @@ async def write_value_to_node_from_excel(client, row, node_id_str, new_value_fro
     target_node = node_cache.get(node_id_str)
     
     if not target_node:
-        _logger.error(f"Node with NodeId '{node_id_str}' not found in cache. Cannot write from Excel row {row}.")
+        _logger.error(f"Node with NodeId '{node_id_str}' not found in cache. Cannot write from Excel row {row}. (Perhaps node was deleted from server?)")
         return
 
     try:
+        # Get the current data value to infer the target variant type
+        # This is important as we want to write the correct OPC UA type
         current_data_value = await target_node.read_data_value()
         target_variant_type = current_data_value.Value.VariantType
 
-        converted_value = _convert_input_to_opc_type(str(new_value_from_excel), target_variant_type)
-        if converted_value is None:
+        converted_value = _convert_input_to_opc_type(new_value_from_excel, target_variant_type)
+        if converted_value is None and new_value_from_excel is not None and str(new_value_from_excel).strip() != '':
+            # Only log error if conversion failed and input was not truly empty
             _logger.error(f"Value conversion failed for '{new_value_from_excel}' from Excel row {row}. Aborting write to OPC UA.")
             return
 
+        # Create a Variant object with the correct type
+        # If converted_value is None because _convert_input_to_opc_type returned None (e.g., empty string for non-string type)
+        # we still create a Variant, as asyncua's write_value can handle None for some types or attempt conversion.
         variant_to_write = ua.Variant(converted_value, target_variant_type)
         
         await target_node.write_value(variant_to_write)
@@ -218,47 +238,131 @@ async def write_value_to_node_from_excel(client, row, node_id_str, new_value_fro
     except Exception as e:
         _logger.error(f"An unexpected error occurred while writing from Excel row {row} to node '{(await target_node.read_display_name()).Text}': {e}", exc_info=True)
 
+
+async def rescan_opc_ua_nodes(client, sub_handler):
+    """
+    Deletes existing subscriptions, clears caches and Excel,
+    then re-browses the server and re-subscribes.
+    """
+    global subscription # Access the global subscription object
+    global excel_last_read_values # --- FIXED: Access global excel_last_read_values ---
+
+    _logger.info("Initiating full OPC UA node re-scan...")
+
+    # 1. Delete existing subscription if any
+    if subscription:
+        try:
+            _logger.info("Deleting existing subscription...")
+            await subscription.delete()
+            _logger.info("Subscription deleted.")
+        except Exception as e:
+            _logger.warning(f"Error deleting old subscription during rescan: {e}")
+        finally:
+            subscription = None # Ensure it's marked as deleted
+
+    # 2. Clear all cached node information
+    node_cache.clear()
+    node_display_names.clear()
+    node_excel_row.clear()
+    excel_row_to_node_id.clear()
+    excel_last_read_values.clear() # Clear Excel read values as well
+
+    # 3. Clear Excel data (important for a clean sync)
+    setup_excel() # This also clears below headers
+
+    # 4. Create a new subscription
+    try:
+        subscription = await client.create_subscription(500, sub_handler)
+        _logger.info("New subscription created for re-scan.")
+    except Exception as e:
+        _logger.error(f"Failed to create new subscription during rescan: {e}")
+        return # Cannot proceed without a subscription
+
+    # 5. Re-browse server and re-subscribe to data variables
+    _logger.info("Re-browsing server and re-subscribing to data variables...")
+    objects_node = client.get_objects_node()
+    start_time = time.time()  # Start time for debugging
+    await browse_and_subscribe_recursive(objects_node, subscription, client)
+    end_time = time.time()  # End time for debugging
+    _logger.info(f"Re-scan completed in {end_time - start_time:.2f} seconds.")
+    _logger.info("OPC UA node re-scan complete.")
+
+    # Re-populate excel_last_read_values after re-scan
+    # This loop is crucial because initial `write_data_to_excel` populates `node_excel_row`
+    # and `write_data_to_excel` also updates `excel_last_read_values`
+    # We do a final loop here just to ensure everything is consistent
+    # (though `write_data_to_excel` should have set these already)
+    for node_id_str, row in node_excel_row.items():
+        value = read_data_from_excel_row(row)
+        excel_last_read_values[row] = value
+    _logger.info("Excel baseline values re-established after re-scan.")
+
+
 # --- Main Client Application (Async) ---
 async def main():
+    global subscription # Declare global so we can assign to it
+    # excel_last_read_values is already global, no need to declare here
+
     client = Client(SERVER_URL)
-    subscription = None
-
-    setup_excel()
-    excel_last_read_values = {} # To track changes in Excel
-
+    
     try:
         _logger.info(f"Attempting to connect to {SERVER_URL}...")
-        async with client:
+        async with client: # Use async with for graceful connect/disconnect
             _logger.info("Connection successful!")
 
             handler = SubHandler()
-            subscription = await client.create_subscription(500, handler)
-
-            _logger.info("Starting recursive browsing from 'Objects' folder and subscribing to data variables/properties...")
-            objects_node = client.get_objects_node()
-            await browse_and_subscribe_recursive(objects_node, subscription, client)
             
-            _logger.info("Subscription setup complete. Monitoring data changes and Excel updates...")
-            _logger.info("Keep the Excel file open. Changes in OPC UA will update Excel. Changes in Excel will update OPC UA.")
+            # Perform initial setup and scan
+            await rescan_opc_ua_nodes(client, handler)
+            
+            _logger.info("Monitoring data changes from OPC UA to Excel and vice-versa.")
+            _logger.info("Type 'r' to rescan OPC UA nodes, 'q' to quit.")
 
-            # Initial read of all relevant Excel values to establish baseline
-            for node_id_str, row in node_excel_row.items():
-                value = read_data_from_excel_row(row)
-                excel_last_read_values[row] = value
+            # Run a separate task to handle user input (r/q)
+            input_task = asyncio.create_task(read_user_input())
 
-            # Loop to continuously monitor Excel for changes
             while True:
-                # Iterate through all known Excel rows for subscribed nodes
-                for row, node_id_str in excel_row_to_node_id.items():
-                    current_excel_value = read_data_from_excel_row(row)
-                    
-                    # Check if the Excel value has changed since the last read
-                    if row in excel_last_read_values and current_excel_value != excel_last_read_values[row]:
-                        _logger.info(f"Excel change detected in row {row}: '{excel_last_read_values[row]}' -> '{current_excel_value}'")
-                        await write_value_to_node_from_excel(client, row, node_id_str, current_excel_value)
-                        excel_last_read_values[row] = current_excel_value # Update last read value
+                # Use asyncio.wait with a timeout to allow for periodic Excel checks
+                # and to react to user input immediately
+                done, pending = await asyncio.wait([input_task], return_when=asyncio.FIRST_COMPLETED, timeout=0.5) # Reduced timeout for quicker Excel checks
+                
+                # If input_task is done, process its result
+                for task in done:
+                    user_input = task.result().strip().lower()
+                    if user_input == 'q':
+                        _logger.info("Quit command received. Exiting.")
+                        return # Exit the main coroutine
+                    elif user_input == 'r':
+                        await rescan_opc_ua_nodes(client, handler) # Await the rescan operation
+                        input_task = asyncio.create_task(read_user_input()) # Recreate the input task
+                    else:
+                        _logger.info("Unknown command. Type 'r' to rescan, 'q' to quit.")
+                        input_task = asyncio.create_task(read_user_input()) # Recreate the input task
 
-                await asyncio.sleep(1) # Check Excel every second
+                # This block runs periodically (after timeout if no input)
+                # Check for changes in Excel and write to OPC UA
+                # It's crucial that node_excel_row and excel_row_to_node_id are up-to-date
+                # which they are after initial scan and rescan.
+                for row, node_id_str in list(excel_row_to_node_id.items()): # Iterate over a copy in case dict changes during iteration
+                    try:
+                        current_excel_value = read_data_from_excel_row(row)
+                        
+                        # Check if the Excel value has changed since the last read
+                        # `get(row)` is safer in case a row was somehow deleted from tracking
+                        if current_excel_value != excel_last_read_values.get(row):
+                            _logger.info(f"Excel detected change in row {row} (NodeId: {node_id_str}): old='{excel_last_read_values.get(row)}', new='{current_excel_value}'")
+                            
+                            await write_value_to_node_from_excel(client, row, node_id_str, current_excel_value)
+                            excel_last_read_values[row] = current_excel_value # Update baseline after successful write
+
+                    except Exception as e:
+                        _logger.error(f"Error processing Excel row {row} (NodeId: {node_id_str}): {e}", exc_info=True)
+                        # Consider if you want to remove this row from tracking if it's a persistent error
+                        # For now, it will just keep trying.
+                        pass # Continue to next row even if one fails
+
+                
+
 
     except ConnectionRefusedError:
         _logger.error(f"Connection refused. Is the server running at {SERVER_URL}?")
@@ -268,24 +372,28 @@ async def main():
     except Exception as e:
         _logger.error(f"An unexpected error occurred: {e}", exc_info=True)
     finally:
+        # Final cleanup for subscription and Excel
         if subscription:
             _logger.info("Deleting subscription...")
             try:
                 await subscription.delete()
                 _logger.info("Subscription deleted.")
             except Exception as e:
-                _logger.warning(f"Error deleting subscription: {e}")
+                _logger.warning(f"Error deleting final subscription: {e}")
         
-        # Ensure Excel workbook is closed gracefully if it was opened by xlwings
         if wb:
             try:
-                wb.save() # Save any changes made by the script
+                wb.save() # Save any remaining changes made by the script
                 wb.close()
-                _logger.info("Excel workbook closed.")
+                _logger.info("Excel workbook saved and closed.")
             except Exception as e:
-                _logger.warning(f"Error closing Excel workbook: {e}")
+                _logger.warning(f"Error saving/closing Excel workbook: {e}")
 
         _logger.info("Client application finished.")
+
+async def read_user_input():
+    """Reads a line from stdin in an async-compatible way."""
+    return await asyncio.to_thread(sys.stdin.readline)
 
 if __name__ == "__main__":
     asyncio.run(main())
