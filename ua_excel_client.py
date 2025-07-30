@@ -3,11 +3,15 @@ import time
 import asyncio
 import logging
 import sys
+import os # <-- ADD THIS IMPORT
 from asyncua import Client, ua
 
 # --- Configuration ---
 # Replace with your server's endpoint URL
-SERVER_URL = "opc.tcp://localhost:4840/simulator/server"
+# SERVER_URL = "opc.tcp://localhost:4840/simulator/server" # <-- REMOVE OR COMMENT OUT THIS LINE
+
+# New: Configuration file name
+CONFIG_FILE = 'config.txt'
 
 # Excel Configuration
 EXCEL_FILE = './OPC_UA_Data.xlsx'
@@ -36,7 +40,40 @@ subscription = None
 
 # This dictionary will store the last known value from Excel for each row
 # Used to detect manual changes by the user in Excel
-excel_last_read_values = {} # --- FIXED: Defined globally here ---
+excel_last_read_values = {}
+
+# --- New Function to Load Configuration ---
+def load_config(config_file_name):
+    """
+    Loads configuration from a specified file.
+    Expects key=value pairs, one per line. Skips comments (#) and empty lines.
+    """
+    config = {}
+    # Construct the full path to the config file relative to the script
+    script_dir = os.path.dirname(__file__)
+    config_path = os.path.join(script_dir, config_file_name)
+
+    if not os.path.exists(config_path):
+        _logger.error(f"Error: Configuration file '{config_path}' not found.")
+        _logger.error("Please create a 'config.txt' file in the same directory as 'ua_excel_client.py'.")
+        _logger.error("It should contain 'SERVER_URL=opc.tcp://your_server_address:port/path' (e.g., SERVER_URL=opc.tcp://localhost:4840/simulator/server).")
+        sys.exit(1) # Exit if the config file is missing
+
+    try:
+        with open(config_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): # Skip empty lines and comments
+                    continue
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+    except Exception as e:
+        _logger.error(f"Error reading configuration file '{config_path}': {e}")
+        sys.exit(1) # Exit if there's an error reading the config file
+
+    return config
+
 
 # --- Excel Functions ---
 def setup_excel():
@@ -76,7 +113,7 @@ def get_next_available_row():
 
 def write_data_to_excel(node_id_str, display_name, value, data_type):
     """Writes a single data point to Excel or updates an existing one."""
-    global node_excel_row, excel_row_to_node_id, excel_last_read_values # --- FIXED: Add excel_last_read_values to globals ---
+    global node_excel_row, excel_row_to_node_id, excel_last_read_values
 
     row = node_excel_row.get(node_id_str)
     if row is None:
@@ -93,10 +130,10 @@ def write_data_to_excel(node_id_str, display_name, value, data_type):
     sheet.range((row, VALUE_COL)).value = value
     sheet.range((row, DATATYPE_COL)).value = data_type
     
-    # --- IMPORTANT FIX: Update excel_last_read_values when we write from OPC UA ---
+    # IMPORTANT FIX: Update excel_last_read_values when we write from OPC UA
     # This prevents the change from OPC UA from immediately triggering an Excel->OPC UA write back
     excel_last_read_values[row] = value 
-    # _logger.debug(f"Excel updated: {display_name} = {value}")
+
 
 def read_data_from_excel_row(row):
     """Reads the value from a specific Excel row's Value column."""
@@ -141,8 +178,6 @@ async def browse_and_subscribe_recursive(node, subscription_obj, client, level=0
     except Exception as e:
         _logger.warning(f"{indent}Could not browse children of '{await node.read_display_name()}' ({str(node.nodeid)}): {e}")
         return
-
-    # _logger.debug(f"{indent}Browsing: {await node.read_display_name()} ({str(node.nodeid)}) - Found {len(children)} children.")
 
     for child in children:
         child_display_name = "N/A"
@@ -244,8 +279,8 @@ async def rescan_opc_ua_nodes(client, sub_handler):
     Deletes existing subscriptions, clears caches and Excel,
     then re-browses the server and re-subscribes.
     """
-    global subscription # Access the global subscription object
-    global excel_last_read_values # --- FIXED: Access global excel_last_read_values ---
+    global subscription 
+    global excel_last_read_values 
 
     _logger.info("Initiating full OPC UA node re-scan...")
 
@@ -258,14 +293,14 @@ async def rescan_opc_ua_nodes(client, sub_handler):
         except Exception as e:
             _logger.warning(f"Error deleting old subscription during rescan: {e}")
         finally:
-            subscription = None # Ensure it's marked as deleted
+            subscription = None 
 
     # 2. Clear all cached node information
     node_cache.clear()
     node_display_names.clear()
     node_excel_row.clear()
     excel_row_to_node_id.clear()
-    excel_last_read_values.clear() # Clear Excel read values as well
+    excel_last_read_values.clear() 
 
     # 3. Clear Excel data (important for a clean sync)
     setup_excel() # This also clears below headers
@@ -276,14 +311,14 @@ async def rescan_opc_ua_nodes(client, sub_handler):
         _logger.info("New subscription created for re-scan.")
     except Exception as e:
         _logger.error(f"Failed to create new subscription during rescan: {e}")
-        return # Cannot proceed without a subscription
+        return 
 
     # 5. Re-browse server and re-subscribe to data variables
     _logger.info("Re-browsing server and re-subscribing to data variables...")
     objects_node = client.get_objects_node()
-    start_time = time.time()  # Start time for debugging
+    start_time = time.time()  
     await browse_and_subscribe_recursive(objects_node, subscription, client)
-    end_time = time.time()  # End time for debugging
+    end_time = time.time()  
     _logger.info(f"Re-scan completed in {end_time - start_time:.2f} seconds.")
     _logger.info("OPC UA node re-scan complete.")
 
@@ -300,14 +335,21 @@ async def rescan_opc_ua_nodes(client, sub_handler):
 
 # --- Main Client Application (Async) ---
 async def main():
-    global subscription # Declare global so we can assign to it
-    # excel_last_read_values is already global, no need to declare here
+    global subscription 
 
-    client = Client(SERVER_URL)
+    # --- Load Configuration ---
+    app_config = load_config(CONFIG_FILE)
+    server_url = app_config.get("SERVER_URL")
+
+    if not server_url:
+        _logger.error("SERVER_URL not found in config.txt. Please ensure it's defined (e.g., SERVER_URL=opc.tcp://localhost:4840/simulator/server).")
+        sys.exit(1) # Exit if SERVER_URL is not found in the config
+
+    client = Client(server_url) # Use the loaded server_url
     
     try:
-        _logger.info(f"Attempting to connect to {SERVER_URL}...")
-        async with client: # Use async with for graceful connect/disconnect
+        _logger.info(f"Attempting to connect to {server_url} (from {CONFIG_FILE})...") # Log the source
+        async with client: 
             _logger.info("Connection successful!")
 
             handler = SubHandler()
@@ -324,48 +366,40 @@ async def main():
             while True:
                 # Use asyncio.wait with a timeout to allow for periodic Excel checks
                 # and to react to user input immediately
-                done, pending = await asyncio.wait([input_task], return_when=asyncio.FIRST_COMPLETED, timeout=0.5) # Reduced timeout for quicker Excel checks
+                done, pending = await asyncio.wait([input_task], return_when=asyncio.FIRST_COMPLETED, timeout=0.5) 
                 
                 # If input_task is done, process its result
                 for task in done:
                     user_input = task.result().strip().lower()
                     if user_input == 'q':
                         _logger.info("Quit command received. Exiting.")
-                        return # Exit the main coroutine
+                        return 
                     elif user_input == 'r':
-                        await rescan_opc_ua_nodes(client, handler) # Await the rescan operation
-                        input_task = asyncio.create_task(read_user_input()) # Recreate the input task
+                        await rescan_opc_ua_nodes(client, handler) 
+                        input_task = asyncio.create_task(read_user_input()) 
                     else:
                         _logger.info("Unknown command. Type 'r' to rescan, 'q' to quit.")
-                        input_task = asyncio.create_task(read_user_input()) # Recreate the input task
+                        input_task = asyncio.create_task(read_user_input()) 
 
                 # This block runs periodically (after timeout if no input)
                 # Check for changes in Excel and write to OPC UA
-                # It's crucial that node_excel_row and excel_row_to_node_id are up-to-date
-                # which they are after initial scan and rescan.
-                for row, node_id_str in list(excel_row_to_node_id.items()): # Iterate over a copy in case dict changes during iteration
+                for row, node_id_str in list(excel_row_to_node_id.items()):
                     try:
                         current_excel_value = read_data_from_excel_row(row)
                         
                         # Check if the Excel value has changed since the last read
-                        # `get(row)` is safer in case a row was somehow deleted from tracking
                         if current_excel_value != excel_last_read_values.get(row):
                             _logger.info(f"Excel detected change in row {row} (NodeId: {node_id_str}): old='{excel_last_read_values.get(row)}', new='{current_excel_value}'")
                             
                             await write_value_to_node_from_excel(client, row, node_id_str, current_excel_value)
-                            excel_last_read_values[row] = current_excel_value # Update baseline after successful write
+                            excel_last_read_values[row] = current_excel_value 
 
                     except Exception as e:
                         _logger.error(f"Error processing Excel row {row} (NodeId: {node_id_str}): {e}", exc_info=True)
-                        # Consider if you want to remove this row from tracking if it's a persistent error
-                        # For now, it will just keep trying.
-                        pass # Continue to next row even if one fails
-
-                
-
+                        pass 
 
     except ConnectionRefusedError:
-        _logger.error(f"Connection refused. Is the server running at {SERVER_URL}?")
+        _logger.error(f"Connection refused. Is the server running at {server_url}?")
     except ua.UaError as e:
         _logger.error(f"OPC UA Error: {e.local_description.Text} (Code: {e.code.name})", exc_info=True)
         print(f"OPC UA Error: {e.local_description.Text} (Code: {e.code.name})")
@@ -383,7 +417,7 @@ async def main():
         
         if wb:
             try:
-                wb.save() # Save any remaining changes made by the script
+                wb.save() 
                 wb.close()
                 _logger.info("Excel workbook saved and closed.")
             except Exception as e:
