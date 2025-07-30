@@ -22,8 +22,6 @@ class SubHandler(object):
         """
         Called every time a subscribed node's value changes.
         """
-        # FIX: Use str(node.nodeid) instead of get_nodeid_string
-        print("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         node_id_str = str(node.nodeid)
         display_name = node_display_names.get(node_id_str, "UNKNOWN_NODE")
         _logger.info(f"DATA CHANGE: Node '{display_name}' Value: {val} (DataType: {(data.monitored_item.Value.Value.VariantType)})")
@@ -87,11 +85,6 @@ async def browse_and_subscribe_recursive(node, subscription, client, level=0):
 
 # --- Write Value Function (Async) ---
 def _convert_input_to_opc_type(value_str, target_variant_type):
-    """
-    Tries to convert a string input to the target OPC UA VariantType.
-    This is a simplified helper; real-world apps might need more robust parsing
-    or support for arrays/complex types.
-    """
     try:
         if target_variant_type == ua.VariantType.Boolean:
             return value_str.lower() in ('true', '1', 't', 'y')
@@ -213,10 +206,8 @@ async def main():
         async with client: # Use async with for graceful connect/disconnect
             _logger.info("Connection successful!")
 
-            # Create subscription handler
             handler = SubHandler()
-            # Create a subscription with a publishing interval (e.g., 500 ms)
-            subscription = await client.create_subscription(500, handler) # Await subscription creation
+            subscription = await client.create_subscription(500, handler)
 
             _logger.info("Starting recursive browsing from 'Objects' folder and subscribing to data variables/properties...")
             objects_node = client.get_objects_node() # This returns a Node object, not a coroutine
@@ -243,9 +234,8 @@ async def main():
                         input_task = asyncio.create_task(read_user_input())
                     else:
                         print("Unknown command. Type 'w' to write, 'q' to quit.")
-                        input_task = asyncio.create_task(read_user_input()) # Recreate the input task
+                        input_task = asyncio.create_task(read_user_input())
 
-                # If no input, just loop (data changes are handled by the subscription handler)
                 if not done:
                     pass
 
@@ -257,8 +247,6 @@ async def main():
     except Exception as e:
         _logger.error(f"An unexpected error occurred: {e}", exc_info=True)
     finally:
-        # The 'async with client:' block handles disconnection.
-        # We only need to explicitly delete the subscription if it was successfully created.
         if subscription:
             _logger.info("Deleting subscription...")
             try:
@@ -268,11 +256,9 @@ async def main():
                 _logger.warning(f"Error deleting subscription: {e}")
         _logger.info("Client application finished.")
 
-# Helper to read user input asynchronously
 async def read_user_input():
     """Reads a line from stdin in an async-compatible way."""
-    return await asyncio.to_thread(sys.stdin.readline) # Run blocking input in a separate thread
+    return await asyncio.to_thread(sys.stdin.readline)
 
 if __name__ == "__main__":
-    # Run the main async function
     asyncio.run(main())
